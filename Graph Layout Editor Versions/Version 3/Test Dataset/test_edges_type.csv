@@ -1,0 +1,11 @@
+source,target,type
+Alpha,Beta,logical
+Beta,Gamma,stochastic
+Gamma,Delta,logical
+Delta,Theta,stochastic
+Alpha,Epsilon,stochastic
+Epsilon,Zeta,logical
+Zeta,Eta,stochastic
+Eta,Theta,logical
+Beta,Zeta,stochastic
+Gamma,Eta,logical
