@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Layout Editor v6 – Plates Support</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      display: flex;
+    }
+    #sidebar {
+      width: 200px;
+      background: #f5f5f5;
+      padding: 10px;
+      border-right: 1px solid #ccc;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    #controls { flex-grow: 1; }
+    #legend {
+      border-top: 1px solid #ccc;
+      padding-top: 10px;
+      margin-top: 10px;
+    }
+    #legend h4 { margin: 4px 0; font-size: 14px; text-align: center; }
+    .legend-item { display: flex; align-items: center; margin: 4px 0; font-size: 13px; }
+    .legend-color { width: 20px; height: 4px; margin-right: 6px; }
+    #graph { flex: 1; }
+    button, label, input { display: block; margin: 8px 0; width: 100%; }
+    svg { width: 100%; height: 100vh; background: white; }
+    ellipse { fill: #69b3a2; stroke: #333; stroke-width: 1.5px; }
+    text { fill: black; font-size: 14px; pointer-events: none; }
+    line { stroke-width: 1.5px; marker-end: url(#arrow); }
+    .dropdown { position: relative; display: inline-block; width: 100%; }
+    .dropdown-content {
+      display: none; position: absolute; background-color: #fff; border: 1px solid #ccc;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.2); z-index: 10; width: 100%;
+    }
+    .dropdown-content button {
+      width: 100%; background: none; border: none; text-align: left; padding: 8px; cursor: pointer;
+    }
+    .dropdown-content button:hover { background-color: #e0e0e0; }
+    .dropdown.show .dropdown-content { display: block; }
+
+    /* plate styles are inline on elements but this provides fallback */
+    .plate-rect {
+      fill: rgba(200,200,255,0.18);
+      stroke: rgba(80,80,200,0.8);
+      stroke-width: 1.5px;
+      rx: 6px;
+      ry: 6px;
+    }
+
+    /* small label for plate */
+    .plate-label {
+      font-size: 12px;
+      fill: rgba(40,40,100,0.9);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="controls">
+      <button id="fitView">Fit to view</button>
+      <label for="gridSpacing">Grid spacing:</label>
+      <input id="gridSpacing" type="number" value="5" min="1" step="1" />
+      <label for="nodeFile">Upload nodes CSV:</label>
+      <input type="file" id="nodeFile" accept=".csv" />
+      <label for="edgeFile">Upload edges CSV:</label>
+      <input type="file" id="edgeFile" accept=".csv" />
+      <button id="loadGraph">Load Graph</button>
+
+      <div class="dropdown" id="exportDropdown">
+        <button id="exportBtn">Export ▼</button>
+        <div class="dropdown-content">
+          <button id="exportSVG">Export as SVG</button>
+          <button id="exportPNG">Export as PNG</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="legend">
+      <h4>Legend</h4>
+      <div class="legend-item">
+        <div class="legend-color" style="background: blue;"></div>
+        Logical relationship
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: red;"></div>
+        Stochastic relationship
+      </div>
+      <div style="margin-top:8px;font-size:12px;color:#555;">
+        Plates: use "Plates" column in nodes CSV to group nodes into named plates.
+      </div>
+    </div>
+  </div>
+
+  <div id="graph"></div>
+
+  <script>
+    /* === Setup and globals === */
+    const width = window.innerWidth - 200;
+    const height = window.innerHeight;
+
+    const svg = d3.select("#graph").append("svg")
+      .attr("width", width)
+      .attr("height", height);
+
+    // Zoom behavior (for fit-to-view)
+    const zoom = d3.zoom().on("zoom", (event) => {
+      mainGroup.attr("transform", event.transform);
+    });
+    svg.call(zoom);
+
+    // defs (arrow marker)
+    const defs = svg.append("defs");
+    defs.append("marker")
+      .attr("id", "arrow")
+      .attr("viewBox", "0 -5 10 10")
+      .attr("refX", 10)
+      .attr("refY", 0)
+      .attr("markerWidth", 6)
+      .attr("markerHeight", 6)
+      .attr("orient", "auto")
+      .append("path")
+      .attr("d", "M0,-5L10,0L0,5")
+      .attr("fill", "#999");
+
+    // main group that gets zoom/pan transforms
+    const mainGroup = svg.append("g");
+
+    // order matters: plates behind links behind nodes
+    const platesGroup = mainGroup.append("g").attr("class", "plates");
+    const linkGroup = mainGroup.append("g").attr("class", "links");
+    const nodeGroup = mainGroup.append("g").attr("class", "nodes");
+
+    let nodes = [];   // {id, x, y, rx, ry, plate}
+    let links = [];   // {source: nodeObj, target: nodeObj, type}
+    let plates = [];  // {id: plateName, nodes: [...], x,y,width,height, padding}
+
+    /* === Utility functions === */
+    function getEdgeColor(type) {
+      return type === "logical" ? "blue" :
+             type === "stochastic" ? "red" : "#999";
+    }
+
+    function getEdgeEndpoint(src, tgt) {
+      const dx = tgt.x - src.x, dy = tgt.y - src.y;
+      const angle = Math.atan2(dy, dx);
+      const cos = Math.cos(angle), sin = Math.sin(angle);
+      const px = tgt.x - tgt.rx * cos;
+      const py = tgt.y - tgt.ry * sin;
+      return [px, py];
+    }
+
+    // compute text widths and rx/ry for nodes
+    function recomputeNodeSizes(arr) {
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx.font = "14px sans-serif";
+      arr.forEach(d => {
+        const textWidth = ctx.measureText(d.id).width;
+        d.rx = textWidth / 2 + 12;
+        d.ry = 18;
+      });
+    }
+
+    /* === Plates management === */
+    // build plates list from nodes array: group nodes by node.plate (non-empty)
+    function computePlatesFromNodes() {
+      const map = new Map();
+      nodes.forEach(n => {
+        const p = (n.plate || "").toString().trim();
+        if (p && p.toLowerCase() !== "none") {
+          if (!map.has(p)) map.set(p, []);
+          map.get(p).push(n);
+        }
+      });
+      plates = Array.from(map.entries()).map(([plateId, nodeList]) => {
+        return { id: plateId, nodes: nodeList, x: 0, y: 0, width: 0, height: 0, padding: 20 };
+      });
+      recomputePlateBounds();
+    }
+
+    function recomputePlateBounds() {
+      plates.forEach(p => {
+        if (!p.nodes.length) {
+          p.x = p.y = p.width = p.height = 0;
+          return;
+        }
+        const padding = p.padding || 20;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        p.nodes.forEach(n => {
+          minX = Math.min(minX, n.x - n.rx);
+          minY = Math.min(minY, n.y - n.ry);
+          maxX = Math.max(maxX, n.x + n.rx);
+          maxY = Math.max(maxY, n.y + n.ry);
+        });
+        p.x = minX - padding;
+        p.y = minY - padding;
+        p.width = (maxX - minX) + padding * 2;
+        p.height = (maxY - minY) + padding * 2;
+      });
+    }
+
+    /* === Graph drawing/interaction === */
+    function drawGraph() {
+      // clear groups
+      platesGroup.selectAll("*").remove();
+      linkGroup.selectAll("*").remove();
+      nodeGroup.selectAll("*").remove();
+
+      // draw plates first (so behind nodes)
+      const plateSelection = platesGroup.selectAll(".plate")
+        .data(plates, d => d.id);
+
+      const plateEnter = plateSelection.enter().append("g")
+        .attr("class", "plate")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .call(d3.drag()
+          .on("start", function(event, d) {
+            d.__dragStart = { x: d.x, y: d.y };
+          })
+          .on("drag", function(event, d) {
+            const dx = event.dx, dy = event.dy;
+            // move plate box
+            d.x += dx; d.y += dy;
+            d3.select(this).attr("transform", `translate(${d.x},${d.y})`);
+            // move nodes within
+            d.nodes.forEach(n => {
+              n.x += dx; n.y += dy;
+            });
+            // update nodes positions and links
+            nodeGroup.selectAll("g.node").data(nodes).attr("transform", n => `translate(${n.x},${n.y})`);
+            updateLinks();
+          })
+          .on("end", function(event, d) {
+            delete d.__dragStart;
+          })
+        );
+
+      // rect
+      plateEnter.append("rect")
+        .attr("class", "plate-rect")
+        .attr("x", 0)
+        .attr("y", 0)
+        .attr("rx", 8)
+        .attr("ry", 8)
+        .attr("fill", "rgba(200,200,255,0.14)")
+        .attr("stroke", "rgba(80,80,200,0.8)")
+        .attr("stroke-width", 1.5);
+
+      // plate label
+      plateEnter.append("text")
+        .attr("class", "plate-label")
+        .attr("x", 8)
+        .attr("y", 14)
+        .text(d => d.id);
+
+      // set rect sizes and return full selection for updates
+      platesGroup.selectAll(".plate").each(function(d) {
+        d3.select(this).select("rect")
+          .attr("width", Math.max(10, d.width))
+          .attr("height", Math.max(10, d.height));
+      });
+
+      // links
+      links.forEach(l => {
+        // ensure source/target are object refs
+        if (typeof l.source === "string") l.source = nodes.find(n => n.id === l.source);
+        if (typeof l.target === "string") l.target = nodes.find(n => n.id === l.target);
+      });
+
+      const linkSelection = linkGroup.selectAll("line")
+        .data(links, (d,i) => `${d.source.id}-${d.target.id}-${i}`);
+
+      linkSelection.enter().append("line")
+        .attr("stroke", d => getEdgeColor(d.type))
+        .attr("marker-end", "url(#arrow)");
+
+      // nodes
+      const nodeSelection = nodeGroup.selectAll("g.node")
+        .data(nodes, d => d.id);
+
+      const nodeEnter = nodeSelection.enter().append("g")
+        .attr("class", "node")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .call(d3.drag()
+          .on("start", function(event, d) {
+            d.__dragging = true;
+            d.__start = { x: d.x, y: d.y };
+          })
+          .on("drag", function(event, d) {
+            d.x = event.x;
+            d.y = event.y;
+            d3.select(this).attr("transform", `translate(${d.x},${d.y})`);
+            updateLinks();
+            // live update plate bound for containing plate
+            if (d.plate) {
+              recomputePlateBounds();
+              platesGroup.selectAll(".plate").attr("transform", p => `translate(${p.x},${p.y})`);
+              platesGroup.selectAll(".plate").each(function(p) {
+                d3.select(this).select("rect").attr("width", Math.max(10, p.width)).attr("height", Math.max(10, p.height));
+              });
+            }
+          })
+          .on("end", function(event, d) {
+            d.__dragging = false;
+            // snap to grid
+            const spacing = +document.getElementById("gridSpacing").value || 5;
+            d.x = Math.round(d.x / spacing) * spacing;
+            d.y = Math.round(d.y / spacing) * spacing;
+            d3.select(this).attr("transform", `translate(${d.x},${d.y})`);
+            // ensure plates recompute final bounds
+            recomputePlateBounds();
+            platesGroup.selectAll(".plate").attr("transform", p => `translate(${p.x},${p.y})`);
+            platesGroup.selectAll(".plate").each(function(p) {
+              d3.select(this).select("rect").attr("width", Math.max(10, p.width)).attr("height", Math.max(10, p.height));
+            });
+            updateLinks();
+          })
+        );
+
+      nodeEnter.append("ellipse")
+        .attr("rx", d => d.rx)
+        .attr("ry", d => d.ry)
+        .attr("fill", "#69b3a2")
+        .attr("stroke", "#333")
+        .attr("stroke-width", 1.5);
+
+      nodeEnter.append("text")
+        .attr("text-anchor", "middle")
+        .attr("dy", "0.35em")
+        .text(d => d.id);
+
+      // update link positions
+      updateLinks();
+    }
+
+    function updateLinks() {
+      linkGroup.selectAll("line").each(function(d) {
+        const [xt, yt] = getEdgeEndpoint(d.source, d.target);
+        d3.select(this)
+          .attr("x1", d.source.x)
+          .attr("y1", d.source.y)
+          .attr("x2", xt)
+          .attr("y2", yt);
+      });
+    }
+
+    /* === Fit to view (using zoom transform) === */
+    function fitToView() {
+      // if nothing in graph, reset view
+      const nodesBbox = mainGroup.node().getBBox();
+      if (!nodesBbox || (nodesBbox.width === 0 && nodesBbox.height === 0)) {
+        svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+        return;
+      }
+      const fullWidth = width, fullHeight = height;
+      const widthRatio = fullWidth / nodesBbox.width;
+      const heightRatio = fullHeight / nodesBbox.height;
+      const scale = Math.min(widthRatio, heightRatio) * 0.88;
+      const translate = [
+        fullWidth / 2 - scale * (nodesBbox.x + nodesBbox.width / 2),
+        fullHeight / 2 - scale * (nodesBbox.y + nodesBbox.height / 2)
+      ];
+      svg.transition().duration(600).call(
+        zoom.transform,
+        d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale)
+      );
+    }
+    document.getElementById("fitView").addEventListener("click", fitToView);
+
+    /* === CSV Load / Reset graph === */
+    // nodes CSV must include columns: id,x,y (optional), Plates (optional)
+    // edges CSV must include columns: source,target,type (type optional)
+    let nodeTable = [];
+    let edgeTable = [];
+
+    function parseCSV(file, callback) {
+      const reader = new FileReader();
+      reader.onload = e => {
+        const text = e.target.result;
+        const rows = d3.csvParse(text);
+        callback(rows);
+      };
+      reader.readAsText(file);
+    }
+
+    document.getElementById("nodeFile").addEventListener("change", function() {
+      if (this.files.length) parseCSV(this.files[0], data => nodeTable = data);
+    });
+    document.getElementById("edgeFile").addEventListener("change", function() {
+      if (this.files.length) parseCSV(this.files[0], data => edgeTable = data);
+    });
+
+    document.getElementById("loadGraph").addEventListener("click", async () => {
+      if (!nodeTable.length || !edgeTable.length) {
+        alert("Please upload both nodes.csv and edges.csv");
+        return;
+      }
+      // build nodes: keep id, x,y if provided else auto-place
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx.font = "14px sans-serif";
+
+      // parse numeric positions if present
+      const newNodes = nodeTable.map((r, i) => {
+        const id = r.id || r.ID || r.name || r.Name || "";
+        const x = (r.x !== undefined && r.x !== "") ? +r.x : NaN;
+        const y = (r.y !== undefined && r.y !== "") ? +r.y : NaN;
+        const plateVal = (r.Plates !== undefined) ? r.Plates : (r.Plates !== undefined ? r.Plates : (r.Plates || r.plates || r.Plates || ""));
+        // Accept 'Plates' or 'plates' column:
+        const plate = (r.Plates !== undefined) ? r.Plates : (r.plates !== undefined ? r.plates : "");
+        return { id: id.toString(), x: isNaN(x) ? null : x, y: isNaN(y) ? null : y, plate: plate ? plate.toString() : "" };
+      });
+
+      // if positions absent, auto arrange in grid
+      recomputeNodeSizes(newNodes);
+      newNodes.forEach((n, i) => {
+        if (n.x == null || n.y == null) {
+          n.x = 200 + (i % 4) * 180;
+          n.y = 200 + Math.floor(i / 4) * 140;
+        }
+      });
+
+      nodes = newNodes;
+
+      // parse edges
+      links = edgeTable.map(e => {
+        const src = e.source || e.Source || e.src || e.SOURCE;
+        const tgt = e.target || e.Target || e.dst || e.TARGET;
+        const type = (e.type || e.Type || "").toString().trim().toLowerCase();
+        return { source: src.toString(), target: tgt.toString(), type: type || "default" };
+      });
+
+      // convert link endpoints to object refs
+      links.forEach(l => {
+        l.source = nodes.find(n => n.id === l.source);
+        l.target = nodes.find(n => n.id === l.target);
+      });
+
+      // create plates
+      computePlatesFromNodes();
+
+      drawGraph();
+      fitToView();
+    });
+
+    /* === Initial demo graph === */
+    function loadDemo() {
+      const demoNodes = [
+        { id: "Alpha" }, { id: "Beta", plate: "GroupA" }, { id: "Gamma", plate: "GroupA" },
+        { id: "Delta", plate: "GroupB" }, { id: "Epsilon" }, { id: "Zeta", plate: "GroupB" }
+      ];
+      recomputeNodeSizes(demoNodes);
+      demoNodes.forEach((d, i) => { d.x = 200 + (i % 3) * 200; d.y = 200 + Math.floor(i / 3) * 150; });
+      nodes = demoNodes;
+      links = [
+        { source: "Alpha", target: "Beta", type: "logical" },
+        { source: "Beta", target: "Gamma", type: "stochastic" },
+        { source: "Gamma", target: "Delta", type: "logical" },
+        { source: "Delta", target: "Epsilon", type: "stochastic" },
+        { source: "Delta", target: "Zeta", type: "logical" }
+      ];
+      // convert link endpoints to object refs
+      links.forEach(l => {
+        l.source = nodes.find(n => n.id === l.source);
+        l.target = nodes.find(n => n.id === l.target);
+      });
+      computePlatesFromNodes();
+      drawGraph();
+      fitToView();
+    }
+    loadDemo();
+
+    /* === Export (SVG/PNG) === */
+    function inlineStyles(svgNode) {
+      svgNode.querySelectorAll("*").forEach(el => {
+        // ignore defs contents substitution for safety, but inline computed styles for shapes/text
+        try {
+          const style = getComputedStyle(el);
+          if (style.fill) el.setAttribute("fill", style.fill);
+          if (style.stroke) el.setAttribute("stroke", style.stroke);
+          if (style.strokeWidth) el.setAttribute("stroke-width", style.strokeWidth);
+          if (style.fontSize) el.setAttribute("font-size", style.fontSize);
+          if (style.fontFamily) el.setAttribute("font-family", style.fontFamily);
+        } catch (err) {
+          // Some nodes may throw when not in DOM; ignore.
+        }
+      });
+    }
+
+    function serializeSVG() {
+      const clone = svg.node().cloneNode(true);
+
+      // ensure marker defs included
+      const defsOrig = document.querySelector("defs");
+      if (defsOrig) {
+        const defsClone = defsOrig.cloneNode(true);
+        // insert defs at top if not present
+        const firstChild = clone.firstChild;
+        if (firstChild) clone.insertBefore(defsClone, firstChild);
+        else clone.appendChild(defsClone);
+      }
+
+      // inline computed styles (for fills/strokes)
+      inlineStyles(clone);
+
+      // ensure xmlns
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+
+      // convert relative marker references if needed (keep as #arrow)
+      clone.querySelectorAll("[marker-end]").forEach(el => {
+        const m = el.getAttribute("marker-end");
+        if (m && m.includes("#arrow")) el.setAttribute("marker-end", "url(#arrow)");
+      });
+
+      return new XMLSerializer().serializeToString(clone);
+    }
+
+    function exportSVG() {
+      const svgData = serializeSVG();
+      const blob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "graph.svg";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportPNG() {
+      const svgData = serializeSVG();
+      const img = new Image();
+      const svgBlob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(svgBlob);
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        canvas.toBlob(blob => {
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "graph.png";
+          a.click();
+        });
+      };
+      img.onerror = (e) => {
+        console.error("Image load error:", e);
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
+    }
+
+    // Dropdown logic
+    const exportDropdown = document.getElementById("exportDropdown");
+    document.getElementById("exportBtn").addEventListener("click", () =>
+      exportDropdown.classList.toggle("show"));
+    document.getElementById("exportSVG").addEventListener("click", exportSVG);
+    document.getElementById("exportPNG").addEventListener("click", exportPNG);
+    window.addEventListener("click", e => {
+      if (!exportDropdown.contains(e.target)) exportDropdown.classList.remove("show");
+    });
+
+    /* === Keep plates bounds updated if nodes moved externally === */
+    // Hook into nodeGroup transforms updates by observing animation frames (keeps plates in sync)
+    function schedulePlateSync() {
+      recomputePlateBounds();
+      platesGroup.selectAll(".plate").data(plates, d=>d.id)
+        .join(
+          enter => enter.append("g").attr("class","plate"),
+          update => update,
+          exit => exit.remove()
+        );
+      // update transforms and rect sizes/labels
+      platesGroup.selectAll(".plate")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .each(function(d) {
+          let rect = d3.select(this).select("rect");
+          if (rect.empty()) {
+            rect = d3.select(this).append("rect").attr("class","plate-rect").attr("rx",8).attr("ry",8)
+              .attr("fill", "rgba(200,200,255,0.14)").attr("stroke", "rgba(80,80,200,0.8)").attr("stroke-width",1.5);
+          }
+          rect.attr("width", Math.max(10,d.width)).attr("height", Math.max(10,d.height));
+          let lbl = d3.select(this).select("text");
+          if (lbl.empty()) lbl = d3.select(this).append("text").attr("class","plate-label").attr("x",8).attr("y",14);
+          lbl.text(d.id);
+        });
+    }
+    // not used heavily; recompute when needed (drag end / node move / loadGraph)
+
+  </script>
+</body>
+</html>

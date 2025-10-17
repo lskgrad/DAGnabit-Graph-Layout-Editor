@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Layout Editor v5 – All Features Fixed</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      display: flex;
+    }
+    #sidebar {
+      width: 200px;
+      background: #f5f5f5;
+      padding: 10px;
+      border-right: 1px solid #ccc;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    #controls { flex-grow: 1; }
+    #legend {
+      border-top: 1px solid #ccc;
+      padding-top: 10px;
+      margin-top: 10px;
+    }
+    #legend h4 {
+      margin: 4px 0;
+      font-size: 14px;
+      text-align: center;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      margin: 4px 0;
+      font-size: 13px;
+    }
+    .legend-color {
+      width: 20px;
+      height: 4px;
+      margin-right: 6px;
+    }
+    #graph { flex: 1; }
+    button, label, input {
+      display: block;
+      margin: 8px 0;
+      width: 100%;
+    }
+    svg {
+      width: 100%;
+      height: 100vh;
+      background: white;
+    }
+    ellipse {
+      fill: #69b3a2;
+      stroke: #333;
+      stroke-width: 1.5px;
+    }
+    text {
+      fill: black;
+      font-size: 14px;
+      pointer-events: none;
+    }
+    line {
+      stroke-width: 1.5px;
+      marker-end: url(#arrow);
+    }
+    .dropdown {
+      position: relative;
+      display: inline-block;
+      width: 100%;
+    }
+    .dropdown-content {
+      display: none;
+      position: absolute;
+      background-color: #fff;
+      border: 1px solid #ccc;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+      z-index: 10;
+      width: 100%;
+    }
+    .dropdown-content button {
+      width: 100%;
+      background: none;
+      border: none;
+      text-align: left;
+      padding: 8px;
+      cursor: pointer;
+    }
+    .dropdown-content button:hover {
+      background-color: #e0e0e0;
+    }
+    .dropdown.show .dropdown-content { display: block; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="controls">
+      <button id="fitView">Fit to view</button>
+      <label for="gridSpacing">Grid spacing:</label>
+      <input id="gridSpacing" type="number" value="5" min="5" step="5" />
+      <label for="nodeFile">Upload nodes CSV:</label>
+      <input type="file" id="nodeFile" accept=".csv" />
+      <label for="edgeFile">Upload edges CSV:</label>
+      <input type="file" id="edgeFile" accept=".csv" />
+      <button id="loadGraph">Load Graph</button>
+
+      <div class="dropdown" id="exportDropdown">
+        <button id="exportBtn">Export ▼</button>
+        <div class="dropdown-content">
+          <button id="exportSVG">Export as SVG</button>
+          <button id="exportPNG">Export as PNG</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="legend">
+      <h4>Legend</h4>
+      <div class="legend-item">
+        <div class="legend-color" style="background: blue;"></div>
+        Logical relationship
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: red;"></div>
+        Stochastic relationship
+      </div>
+    </div>
+  </div>
+
+  <div id="graph"></div>
+
+  <script>
+    const width = window.innerWidth - 200;
+    const height = window.innerHeight;
+
+    const svg = d3.select("#graph").append("svg")
+      .attr("width", width)
+      .attr("height", height);
+
+    // Zoom behavior (for fit-to-view)
+    const zoom = d3.zoom().on("zoom", (event) => {
+      g.attr("transform", event.transform);
+    });
+    svg.call(zoom);
+
+    const defs = svg.append("defs");
+    defs.append("marker")
+      .attr("id", "arrow")
+      .attr("viewBox", "0 -5 10 10")
+      .attr("refX", 10)
+      .attr("refY", 0)
+      .attr("markerWidth", 6)
+      .attr("markerHeight", 6)
+      .attr("orient", "auto")
+      .append("path")
+      .attr("d", "M0,-5L10,0L0,5")
+      .attr("fill", "#999");
+
+    const g = svg.append("g"); // main container
+    const linkGroup = g.append("g").attr("class", "links");
+    const nodeGroup = g.append("g").attr("class", "nodes");
+
+    let nodes = [];
+    let links = [];
+
+    // Default test graph
+    resetGraph([
+      { id: "Alpha" }, { id: "Beta" }, { id: "Gamma" }, { id: "Delta" }, { id: "Epsilon" }
+    ], [
+      { source: "Alpha", target: "Beta", type: "logical" },
+      { source: "Beta", target: "Gamma", type: "stochastic" },
+      { source: "Gamma", target: "Delta", type: "logical" },
+      { source: "Delta", target: "Alpha", type: "stochastic" },
+      { source: "Delta", target: "Epsilon", type: "logical" }
+    ]);
+
+    function resetGraph(newNodes, newLinks) {
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx.font = "14px sans-serif";
+
+      newNodes.forEach((d, i) => {
+        const textWidth = ctx.measureText(d.id).width;
+        d.rx = textWidth / 2 + 12;
+        d.ry = 18;
+        d.x = 200 + (i % 3) * 200;
+        d.y = 200 + Math.floor(i / 3) * 150;
+      });
+
+      nodes = newNodes;
+      links = newLinks.map(l => ({
+        source: nodes.find(n => n.id === l.source),
+        target: nodes.find(n => n.id === l.target),
+        type: l.type
+      }));
+
+      drawGraph();
+      fitToView();
+    }
+
+    function getEdgeColor(type) {
+      return type === "logical" ? "blue" :
+             type === "stochastic" ? "red" : "#999";
+    }
+
+    function getEdgeEndpoint(src, tgt) {
+      const dx = tgt.x - src.x, dy = tgt.y - src.y;
+      const angle = Math.atan2(dy, dx);
+      return [tgt.x - tgt.rx * Math.cos(angle), tgt.y - tgt.ry * Math.sin(angle)];
+    }
+
+    function drawGraph() {
+      linkGroup.selectAll("*").remove();
+      nodeGroup.selectAll("*").remove();
+
+      const link = linkGroup.selectAll("line")
+        .data(links)
+        .enter().append("line")
+        .attr("stroke", d => getEdgeColor(d.type))
+        .attr("marker-end", "url(#arrow)");
+
+      const node = nodeGroup.selectAll("g")
+        .data(nodes)
+        .enter().append("g")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .call(d3.drag()
+          .on("drag", (event, d) => {
+            d.x = event.x;
+            d.y = event.y;
+            update();
+          })
+          .on("end", (event, d) => {
+            const spacing = +document.getElementById("gridSpacing").value || 5;
+            d.x = Math.round(d.x / spacing) * spacing;
+            d.y = Math.round(d.y / spacing) * spacing;
+            update();
+          }));
+
+      node.append("ellipse")
+        .attr("rx", d => d.rx)
+        .attr("ry", d => d.ry)
+        .attr("fill", "#69b3a2")
+        .attr("stroke", "#333")
+        .attr("stroke-width", 1.5);
+
+      node.append("text")
+        .attr("text-anchor", "middle")
+        .attr("dy", "0.35em")
+        .text(d => d.id);
+
+      function update() {
+        link.each(function(d) {
+          const [xt, yt] = getEdgeEndpoint(d.source, d.target);
+          d3.select(this)
+            .attr("x1", d.source.x)
+            .attr("y1", d.source.y)
+            .attr("x2", xt)
+            .attr("y2", yt);
+        });
+        node.attr("transform", d => `translate(${d.x},${d.y})`);
+      }
+      update();
+    }
+
+    // FIT TO VIEW
+    function fitToView() {
+      const bounds = g.node().getBBox();
+      const fullWidth = width, fullHeight = height;
+      const widthRatio = fullWidth / bounds.width;
+      const heightRatio = fullHeight / bounds.height;
+      const scale = Math.min(widthRatio, heightRatio) * 0.9;
+      const translate = [
+        fullWidth / 2 - scale * (bounds.x + bounds.width / 2),
+        fullHeight / 2 - scale * (bounds.y + bounds.height / 2)
+      ];
+      svg.transition().duration(600).call(
+        zoom.transform,
+        d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale)
+      );
+    }
+
+    document.getElementById("fitView").addEventListener("click", fitToView);
+
+    // --- LOAD GRAPH FROM CSV ---
+    document.getElementById("loadGraph").addEventListener("click", async () => {
+      const nodeFile = document.getElementById("nodeFile").files[0];
+      const edgeFile = document.getElementById("edgeFile").files[0];
+      if (!nodeFile || !edgeFile) {
+        alert("Please select both a nodes and edges CSV file.");
+        return;
+      }
+      const nodeText = await nodeFile.text();
+      const edgeText = await edgeFile.text();
+      const nodeData = d3.csvParse(nodeText);
+      const edgeData = d3.csvParse(edgeText);
+      resetGraph(nodeData, edgeData);
+    });
+
+    // --- EXPORT FIX ---
+    function inlineStyles(svgNode) {
+      svgNode.querySelectorAll("*").forEach(el => {
+        const style = getComputedStyle(el);
+        if (style.fill) el.setAttribute("fill", style.fill);
+        if (style.stroke) el.setAttribute("stroke", style.stroke);
+        if (style.strokeWidth) el.setAttribute("stroke-width", style.strokeWidth);
+        if (style.fontSize) el.setAttribute("font-size", style.fontSize);
+        if (style.fontFamily) el.setAttribute("font-family", style.fontFamily);
+      });
+    }
+
+    function serializeSVG() {
+      const clone = svg.node().cloneNode(true);
+      const defsClone = document.querySelector("defs").cloneNode(true);
+      clone.insertBefore(defsClone, clone.firstChild);
+      inlineStyles(clone);
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      return new XMLSerializer().serializeToString(clone);
+    }
+
+    function exportSVG() {
+      const blob = new Blob([serializeSVG()], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "graph.svg";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportPNG() {
+      const svgData = serializeSVG();
+      const img = new Image();
+      const url = URL.createObjectURL(new Blob([svgData], { type: "image/svg+xml;charset=utf-8" }));
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob(blob => {
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "graph.png";
+          a.click();
+        });
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
+    }
+
+    // Dropdown
+    const exportDropdown = document.getElementById("exportDropdown");
+    document.getElementById("exportBtn").addEventListener("click", () =>
+      exportDropdown.classList.toggle("show"));
+    document.getElementById("exportSVG").addEventListener("click", exportSVG);
+    document.getElementById("exportPNG").addEventListener("click", exportPNG);
+    window.addEventListener("click", e => {
+      if (!exportDropdown.contains(e.target)) exportDropdown.classList.remove("show");
+    });
+  </script>
+</body>
+</html>
