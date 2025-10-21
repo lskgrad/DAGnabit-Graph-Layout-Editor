@@ -1,0 +1,9 @@
+id,x,y,Plates
+Alpha,200,200,none
+Beta,400,200,none
+Gamma,600,200,log[i]
+Delta,800,200,none
+Epsilon,300,400,log[i]
+Zeta,500,400,None
+Eta,700,400,BIG BOYS
+Theta,900,400,BIG BOYS
