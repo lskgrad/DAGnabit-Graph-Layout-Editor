@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Layout Editor v8 – Linked Multi-Plate Resizing</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    body { margin: 0; font-family: sans-serif; display: flex; }
+    #sidebar {
+      width: 200px; background: #f5f5f5; padding: 10px;
+      border-right: 1px solid #ccc; display: flex; flex-direction: column; justify-content: space-between;
+    }
+    #controls { flex-grow: 1; }
+    #legend { border-top: 1px solid #ccc; padding-top: 10px; margin-top: 10px; }
+    #legend h4 { margin: 4px 0; font-size: 14px; text-align: center; }
+    .legend-item { display: flex; align-items: center; margin: 4px 0; font-size: 13px; }
+    .legend-color { width: 20px; height: 4px; margin-right: 6px; }
+    #graph { flex: 1; }
+    button, label, input { display: block; margin: 8px 0; width: 100%; }
+    svg { width: 100%; height: 100vh; background: white; }
+    ellipse { fill: #69b3a2; stroke: #333; stroke-width: 1.5px; }
+    text { fill: black; font-size: 14px; pointer-events: none; }
+    line { stroke-width: 1.5px; marker-end: url(#arrow); }
+    .dropdown { position: relative; display: inline-block; width: 100%; }
+    .dropdown-content {
+      display: none; position: absolute; background-color: #fff; border: 1px solid #ccc;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.2); z-index: 10; width: 100%;
+    }
+    .dropdown-content button { width: 100%; background: none; border: none; text-align: left; padding: 8px; cursor: pointer; }
+    .dropdown-content button:hover { background-color: #e0e0e0; }
+    .dropdown.show .dropdown-content { display: block; }
+    .plate-rect {
+      fill: rgba(200,200,255,0.18);
+      stroke: rgba(80,80,200,0.8);
+      stroke-width: 1.5px;
+      rx: 6px; ry: 6px;
+    }
+    .plate-label {
+      font-size: 12px;
+      fill: rgba(40,40,100,0.9);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="controls">
+      <button id="fitView">Fit to view</button>
+      <label for="gridSpacing">Grid spacing:</label>
+      <input id="gridSpacing" type="number" value="5" min="1" step="1" />
+      <label for="nodeFile">Upload nodes CSV:</label>
+      <input type="file" id="nodeFile" accept=".csv" />
+      <label for="edgeFile">Upload edges CSV:</label>
+      <input type="file" id="edgeFile" accept=".csv" />
+      <button id="loadGraph">Load Graph</button>
+
+      <div class="dropdown" id="exportDropdown">
+        <button id="exportBtn">Export ▼</button>
+        <div class="dropdown-content">
+          <button id="exportSVG">Export as SVG</button>
+          <button id="exportPNG">Export as PNG</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="legend">
+      <h4>Legend</h4>
+      <div class="legend-item">
+        <div class="legend-color" style="background: blue;"></div>
+        Logical relationship
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: red;"></div>
+        Stochastic relationship
+      </div>
+      <div style="margin-top:8px;font-size:12px;color:#555;">
+        Plates: separate multiple plates with semicolons (e.g. "GroupA;GroupB").
+      </div>
+    </div>
+  </div>
+
+  <div id="graph"></div>
+
+  <script>
+    const width = window.innerWidth - 200;
+    const height = window.innerHeight;
+    const svg = d3.select("#graph").append("svg").attr("width", width).attr("height", height);
+
+    const zoom = d3.zoom().on("zoom", (event) => mainGroup.attr("transform", event.transform));
+    svg.call(zoom);
+
+    const defs = svg.append("defs");
+    defs.append("marker")
+      .attr("id", "arrow")
+      .attr("viewBox", "0 -5 10 10")
+      .attr("refX", 10).attr("refY", 0)
+      .attr("markerWidth", 6).attr("markerHeight", 6)
+      .attr("orient", "auto")
+      .append("path").attr("d", "M0,-5L10,0L0,5").attr("fill", "#999");
+
+    const mainGroup = svg.append("g");
+    const platesGroup = mainGroup.append("g").attr("class", "plates");
+    const linkGroup = mainGroup.append("g").attr("class", "links");
+    const nodeGroup = mainGroup.append("g").attr("class", "nodes");
+
+    let nodes = [], links = [], plates = [];
+
+    function getEdgeColor(type) {
+      return type === "logical" ? "blue" : type === "stochastic" ? "red" : "#999";
+    }
+
+    function getEdgeEndpoint(src, tgt) {
+      const dx = tgt.x - src.x, dy = tgt.y - src.y;
+      const angle = Math.atan2(dy, dx);
+      const px = tgt.x - tgt.rx * Math.cos(angle);
+      const py = tgt.y - tgt.ry * Math.sin(angle);
+      return [px, py];
+    }
+
+    function recomputeNodeSizes(arr) {
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx.font = "14px sans-serif";
+      arr.forEach(d => {
+        const textWidth = ctx.measureText(d.id).width;
+        d.rx = textWidth / 2 + 12;
+        d.ry = 18;
+      });
+    }
+
+    // === MULTI-PLATE SUPPORT ===
+    function computePlatesFromNodes() {
+      const map = new Map();
+      nodes.forEach(n => {
+        const raw = (n.plate || "").toString().trim();
+        if (!raw || raw.toLowerCase() === "none") return;
+        const list = raw.split(";").map(p => p.trim()).filter(Boolean);
+        n.plates = list;
+        list.forEach(p => {
+          if (!map.has(p)) map.set(p, []);
+          map.get(p).push(n);
+        });
+      });
+      plates = Array.from(map.entries()).map(([id, nodeList]) => ({
+        id, nodes: nodeList, x: 0, y: 0, width: 0, height: 0, padding: 20
+      }));
+      recomputePlateBounds();
+    }
+
+    function recomputePlateBounds() {
+      plates.forEach(p => {
+        if (!p.nodes.length) return;
+        const pad = p.padding || 20;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        p.nodes.forEach(n => {
+          minX = Math.min(minX, n.x - n.rx);
+          minY = Math.min(minY, n.y - n.ry);
+          maxX = Math.max(maxX, n.x + n.rx);
+          maxY = Math.max(maxY, n.y + n.ry);
+        });
+        p.x = minX - pad; p.y = minY - pad;
+        p.width = (maxX - minX) + pad * 2;
+        p.height = (maxY - minY) + pad * 2;
+      });
+    }
+
+    function updatePlatesVisual() {
+      platesGroup.selectAll(".plate").attr("transform", d => `translate(${d.x},${d.y})`)
+        .each(function(d) {
+          d3.select(this).select("rect")
+            .attr("width", Math.max(10, d.width))
+            .attr("height", Math.max(10, d.height));
+        });
+    }
+
+    function updateLinks() {
+      linkGroup.selectAll("line").each(function(d) {
+        const [xt, yt] = getEdgeEndpoint(d.source, d.target);
+        d3.select(this)
+          .attr("x1", d.source.x).attr("y1", d.source.y)
+          .attr("x2", xt).attr("y2", yt);
+      });
+    }
+
+    function drawGraph() {
+      platesGroup.selectAll("*").remove();
+      linkGroup.selectAll("*").remove();
+      nodeGroup.selectAll("*").remove();
+
+      const plateEnter = platesGroup.selectAll(".plate")
+        .data(plates, d => d.id).enter().append("g").attr("class", "plate")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .call(d3.drag()
+          .on("drag", function(event, d) {
+            const dx = event.dx, dy = event.dy;
+            // Move all nodes in this plate
+            d.nodes.forEach(n => { n.x += dx; n.y += dy; });
+            // Recompute bounds for ALL plates containing any moved nodes
+            recomputePlateBounds();
+            updatePlatesVisual();
+            // Move node visuals
+            nodeGroup.selectAll("g.node").data(nodes).attr("transform", n => `translate(${n.x},${n.y})`);
+            updateLinks();
+          })
+        );
+
+      plateEnter.append("rect").attr("class", "plate-rect");
+      plateEnter.append("text").attr("class", "plate-label").attr("x", 8).attr("y", 14).text(d => d.id);
+      updatePlatesVisual();
+
+      links.forEach(l => {
+        if (typeof l.source === "string") l.source = nodes.find(n => n.id === l.source);
+        if (typeof l.target === "string") l.target = nodes.find(n => n.id === l.target);
+      });
+
+      linkGroup.selectAll("line").data(links).enter().append("line")
+        .attr("stroke", d => getEdgeColor(d.type)).attr("marker-end", "url(#arrow)");
+      nodeGroup.selectAll("g.node").data(nodes).enter().append("g")
+        .attr("class", "node")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .call(d3.drag()
+          .on("drag", (event, d) => {
+            d.x = event.x;
+            d.y = event.y;
+            d3.select(event.sourceEvent.target.parentNode)
+              .attr("transform", `translate(${d.x},${d.y})`);
+            updateLinks();
+            recomputePlateBounds();
+            updatePlatesVisual();
+          })
+        )
+        .each(function(d) {
+          const g = d3.select(this);
+          g.append("ellipse")
+            .attr("rx", d.rx).attr("ry", d.ry)
+            .attr("fill", "#69b3a2").attr("stroke", "#333");
+          g.append("text").attr("text-anchor", "middle").attr("dy", 5).text(d.id);
+        });
+
+      updateLinks();
+    }
+
+    function fitToView() {
+      const bounds = mainGroup.node().getBBox();
+      const fullWidth = width, fullHeight = height;
+      const midX = bounds.x + bounds.width / 2, midY = bounds.y + bounds.height / 2;
+      if (bounds.width === 0 || bounds.height === 0) return;
+      const scale = 0.85 / Math.max(bounds.width / fullWidth, bounds.height / fullHeight);
+      const transform = d3.zoomIdentity
+        .translate(fullWidth / 2, fullHeight / 2)
+        .scale(scale)
+        .translate(-midX, -midY);
+      svg.transition().duration(500).call(zoom.transform, transform);
+    }
+
+    // CSV parsing
+    async function readCSV(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(d3.csvParse(e.target.result));
+        reader.onerror = reject;
+        reader.readAsText(file);
+      });
+    }
+
+    document.getElementById("loadGraph").addEventListener("click", async () => {
+      const nodeFile = document.getElementById("nodeFile").files[0];
+      const edgeFile = document.getElementById("edgeFile").files[0];
+      if (!nodeFile || !edgeFile) {
+        alert("Please upload both nodes and edges CSV files.");
+        return;
+      }
+      const [nodeData, edgeData] = await Promise.all([readCSV(nodeFile), readCSV(edgeFile)]);
+      nodes = nodeData.map(d => ({
+        id: d.id || d.name,
+        plate: d.plate || "",
+        x: +d.x || Math.random() * width * 0.8 + 50,
+        y: +d.y || Math.random() * height * 0.8 + 50
+      }));
+      links = edgeData.map(d => ({
+        source: d.source,
+        target: d.target,
+        type: (d.type || "").toLowerCase()
+      }));
+      recomputeNodeSizes(nodes);
+      computePlatesFromNodes();
+      drawGraph();
+    });
+
+    document.getElementById("fitView").addEventListener("click", fitToView);
+
+    // Export dropdown
+    const dropdown = document.getElementById("exportDropdown");
+    document.getElementById("exportBtn").addEventListener("click", () => dropdown.classList.toggle("show"));
+    window.addEventListener("click", (e) => {
+      if (!dropdown.contains(e.target)) dropdown.classList.remove("show");
+    });
+
+    // === EXPORT ===
+    function exportAsSVG() {
+      const serializer = new XMLSerializer();
+      const svgNode = svg.node().cloneNode(true);
+      svgNode.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      const svgString = serializer.serializeToString(svgNode);
+      const blob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "graph_export.svg";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function exportAsPNG() {
+      const serializer = new XMLSerializer();
+      const svgString = serializer.serializeToString(svg.node());
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      const img = new Image();
+      const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(svgBlob);
+      img.onload = function () {
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        const a = document.createElement("a");
+        a.download = "graph_export.png";
+        a.href = canvas.toDataURL("image/png");
+        a.click();
+      };
+      img.src = url;
+    }
+
+    document.getElementById("exportSVG").addEventListener("click", exportAsSVG);
+    document.getElementById("exportPNG").addEventListener("click", exportAsPNG);
+  </script>
+</body>
+</html>

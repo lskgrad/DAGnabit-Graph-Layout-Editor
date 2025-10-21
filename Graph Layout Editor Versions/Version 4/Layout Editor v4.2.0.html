@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Layout Editor — Multi-Plate Stable (Collision-Protected)</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    body { margin:0; font-family: sans-serif; display:flex; height:100vh; }
+    #sidebar {
+      width: 220px; background: #f7f7f7; padding: 12px; border-right: 1px solid #ccc;
+      box-sizing: border-box; display:flex; flex-direction:column; justify-content:space-between;
+    }
+    #controls {}
+    label, button, input { display:block; width:100%; margin:6px 0; box-sizing:border-box; }
+    #graph { flex:1; }
+    svg { width:100%; height:100%; background:#fff; display:block; }
+    .plate-rect { fill: rgba(200,200,255,0.14); stroke: rgba(80,80,200,0.8); stroke-width:1.5px; rx:8; ry:8; }
+    .plate-label { font-size:12px; fill: rgba(40,40,100,0.9); pointer-events:none; }
+    .node-ellipse { fill:#69b3a2; stroke:#333; stroke-width:1.5px; }
+    .node-text { font-size:14px; fill:#000; pointer-events:none; text-anchor:middle; dominant-baseline:central; }
+    .link-line { stroke-width:1.5px; marker-end: url(#arrow); }
+    .legend-item { display:flex; align-items:center; gap:8px; font-size:13px; margin:6px 0; }
+    .legend-color { width:20px; height:8px; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="controls">
+      <button id="fitView">Fit to view</button>
+      <label for="gridSpacing">Grid spacing</label>
+      <input id="gridSpacing" type="number" value="5" min="1"/>
+      <label for="nodeFile">Nodes CSV (Plates use semicolons)</label>
+      <input id="nodeFile" type="file" accept=".csv"/>
+      <label for="edgeFile">Edges CSV</label>
+      <input id="edgeFile" type="file" accept=".csv"/>
+      <button id="loadGraph">Load Graph</button>
+
+      <div style="margin-top:8px;">
+        <div style="position:relative;">
+          <button id="exportBtn">Export ▼</button>
+          <div id="exportMenu" style="display:none; position:absolute; left:0; top:36px; background:#fff; border:1px solid #ccc; box-shadow:0 2px 6px rgba(0,0,0,0.15); width:100%;">
+            <button id="exportSVG" style="border:none; background:none; padding:8px; text-align:left; width:100%;">Export SVG</button>
+            <button id="exportPNG" style="border:none; background:none; padding:8px; text-align:left; width:100%;">Export PNG</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="legend" style="margin-top:10px; border-top:1px solid #ddd; padding-top:8px;">
+      <div style="font-weight:600; text-align:center; margin-bottom:6px;">Legend</div>
+      <div class="legend-item"><div class="legend-color" style="background:blue"></div> Logical</div>
+      <div class="legend-item"><div class="legend-color" style="background:red"></div> Stochastic</div>
+      <div style="font-size:12px; color:#555; margin-top:6px;">Plates: separate names with semicolons (e.g. "A;B").</div>
+    </div>
+  </div>
+
+  <div id="graph"></div>
+
+  <script>
+    const sidebarWidth = 220;
+    let width = window.innerWidth - sidebarWidth;
+    let height = window.innerHeight;
+    const svg = d3.select("#graph").append("svg").attr("width", width).attr("height", height);
+
+    const defs = svg.append("defs");
+    defs.append("marker")
+      .attr("id","arrow").attr("viewBox","0 -5 10 10").attr("refX",10).attr("refY",0)
+      .attr("markerWidth",6).attr("markerHeight",6).attr("orient","auto")
+      .append("path").attr("d","M0,-5L10,0L0,5").attr("fill","#999");
+
+    const mainGroup = svg.append("g");
+    const platesGroup = mainGroup.append("g").attr("class","plates");
+    const linksGroup = mainGroup.append("g").attr("class","links");
+    const nodesGroup = mainGroup.append("g").attr("class","nodes");
+
+    const zoom = d3.zoom().on("zoom", (event)=> mainGroup.attr("transform", event.transform));
+    svg.call(zoom);
+
+    let nodes = [], links = [], plates = [];
+
+    function getEdgeColor(type) {
+      return type === "logical" ? "blue" : type === "stochastic" ? "red" : "#999";
+    }
+
+    function computeTextSizes(arr) {
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx.font = "14px sans-serif";
+      arr.forEach(d => {
+        const w = ctx.measureText(d.id).width;
+        d.rx = Math.max(24, w/2 + 12);
+        d.ry = 16;
+      });
+    }
+
+    function computePlatesFromNodes() {
+      const map = new Map();
+      nodes.forEach(n => {
+        const raw = (n.plate || "").toString().trim();
+        if (!raw || raw.toLowerCase()==="none") { n.plates = []; return; }
+        const list = raw.split(";").map(s => s.trim()).filter(Boolean);
+        n.plates = list;
+        list.forEach(name => {
+          if (!map.has(name)) map.set(name, []);
+          map.get(name).push(n);
+        });
+      });
+      plates = Array.from(map.entries()).map(([id, nodeList]) => ({ id, nodes: nodeList, x:0, y:0, width:0, height:0, padding:18 }));
+      recomputePlateBounds();
+    }
+
+    function recomputePlateBounds() {
+      plates.forEach(p => {
+        if (!p.nodes || p.nodes.length===0) return;
+        const pad = p.padding || 18;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        p.nodes.forEach(n => {
+          minX = Math.min(minX, n.x - n.rx);
+          minY = Math.min(minY, n.y - n.ry);
+          maxX = Math.max(maxX, n.x + n.rx);
+          maxY = Math.max(maxY, n.y + n.ry);
+        });
+        p.x = minX - pad; p.y = minY - pad;
+        p.width = (maxX - minX) + pad*2;
+        p.height = (maxY - minY) + pad*2;
+      });
+    }
+
+    // Helper: check rectangle overlap
+    function rectsOverlap(a,b) {
+      return !(a.x + a.width < b.x || b.x + b.width < a.x || a.y + a.height < b.y || b.y + b.height < a.y);
+    }
+
+    // --- Drawing & interactions ---
+    function updatePlatesSelection() {
+      const sel = platesGroup.selectAll("g.plate").data(plates, d=>d.id);
+      sel.exit().remove();
+
+      const enter = sel.enter().append("g").attr("class","plate")
+        .call(d3.drag()
+          .on("start", (e,d)=> { d.__start = {x:d.x, y:d.y}; })
+          .on("drag", (e,d)=> {
+            const dx = e.dx, dy = e.dy;
+            const newBounds = {x:d.x+dx, y:d.y+dy, width:d.width, height:d.height};
+            // prevent overlap with other plates
+            const overlap = plates.some(p => p!==d && rectsOverlap(newBounds,p));
+            if (overlap) return; // cancel move
+            // move plate + its nodes
+            d.nodes.forEach(n => { n.x += dx; n.y += dy; });
+            recomputePlateBounds();
+            updatePlatesTransform();
+            nodesGroup.selectAll("g.node").attr("transform", n => `translate(${n.x},${n.y})`);
+            updateLinksPositions();
+          })
+          .on("end", (e,d)=> {
+            const spacing = +document.getElementById("gridSpacing").value || 5;
+            d.nodes.forEach(n => {
+              n.x = Math.round(n.x/spacing)*spacing;
+              n.y = Math.round(n.y/spacing)*spacing;
+            });
+            recomputePlateBounds(); updatePlatesTransform();
+            nodesGroup.selectAll("g.node").attr("transform", n => `translate(${n.x},${n.y})`);
+            updateLinksPositions(); delete d.__start;
+          })
+        );
+
+      enter.append("rect").attr("class","plate-rect");
+      enter.append("text").attr("class","plate-label").attr("x",8).attr("y",14);
+
+      platesGroup.selectAll("g.plate").each(function(p){ d3.select(this).select("text").text(p.id); });
+      updatePlatesTransform();
+    }
+
+    function updatePlatesTransform() {
+      platesGroup.selectAll("g.plate")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .each(function(d){ d3.select(this).select("rect").attr("width",d.width).attr("height",d.height); });
+    }
+
+    function updateLinksPositions() {
+      linksGroup.selectAll("line").data(links, d=>`${d.source.id}→${d.target.id}`)
+        .join(
+          enter => enter.append("line")
+                        .attr("class","link-line")
+                        .attr("stroke", d => getEdgeColor(d.type))
+                        .attr("marker-end","url(#arrow)"),
+          update => update,
+          exit => exit.remove()
+        )
+        .each(function(d){
+          const [xt, yt] = computeEdgeEndpoint(d.source, d.target);
+          d3.select(this).attr("x1",d.source.x).attr("y1",d.source.y).attr("x2",xt).attr("y2",yt);
+        });
+    }
+
+    function computeEdgeEndpoint(src,tgt) {
+      const dx = tgt.x - src.x, dy = tgt.y - src.y;
+      const angle = Math.atan2(dy, dx);
+      return [tgt.x - tgt.rx*Math.cos(angle), tgt.y - tgt.ry*Math.sin(angle)];
+    }
+
+    function drawNodes() {
+      const sel = nodesGroup.selectAll("g.node").data(nodes, d=>d.id);
+      sel.exit().remove();
+
+      const enter = sel.enter().append("g").attr("class","node")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .call(d3.drag()
+          .on("start", (e,d)=>{ d.__orig={x:d.x,y:d.y}; })
+          .on("drag", function(e,d){
+            const old = {x:d.x,y:d.y};
+            d.x = e.x; d.y = e.y;
+            // collision: cannot enter plates it doesn't belong to
+            const insideForeign = plates.some(p=>{
+              const inside = d.x>p.x && d.x<p.x+p.width && d.y>p.y && d.y<p.y+p.height;
+              return inside && !d.plates.includes(p.id);
+            });
+            if (insideForeign) { d.x=old.x; d.y=old.y; return; }
+            d3.select(this).attr("transform",`translate(${d.x},${d.y})`);
+            updateLinksPositions(); recomputePlateBounds(); updatePlatesTransform();
+          })
+          .on("end", function(e,d){
+            const spacing = +document.getElementById("gridSpacing").value || 5;
+            d.x = Math.round(d.x/spacing)*spacing;
+            d.y = Math.round(d.y/spacing)*spacing;
+            d3.select(this).attr("transform",`translate(${d.x},${d.y})`);
+            recomputePlateBounds(); updatePlatesTransform(); updateLinksPositions();
+          })
+        );
+
+      enter.append("ellipse").attr("class","node-ellipse");
+      enter.append("text").attr("class","node-text");
+
+      nodesGroup.selectAll("g.node").each(function(d){
+        d3.select(this).select("ellipse").attr("rx",d.rx).attr("ry",d.ry);
+        d3.select(this).select("text").text(d.id);
+        d3.select(this).attr("transform",`translate(${d.x},${d.y})`);
+      });
+      updateLinksPositions();
+    }
+
+    function fitToView() {
+      const bbox = mainGroup.node().getBBox();
+      if (!bbox || bbox.width===0 || bbox.height===0) return;
+      const pad=40;
+      const scale=Math.min((width-pad)/bbox.width,(height-pad)/bbox.height);
+      const tx=(width/2)-scale*(bbox.x+bbox.width/2);
+      const ty=(height/2)-scale*(bbox.y+bbox.height/2);
+      svg.transition().duration(500).call(zoom.transform,d3.zoomIdentity.translate(tx,ty).scale(scale));
+    }
+
+    function parseCSVFile(file) {
+      return new Promise((resolve,reject)=>{
+        const reader=new FileReader();
+        reader.onload=e=>resolve(d3.csvParse(e.target.result));
+        reader.onerror=reject;
+        reader.readAsText(file);
+      });
+    }
+
+    document.getElementById("loadGraph").addEventListener("click", async ()=>{
+      const nf=document.getElementById("nodeFile").files[0];
+      const ef=document.getElementById("edgeFile").files[0];
+      if(!nf||!ef){alert("Please upload nodes and edges CSV");return;}
+      const [nd,ed]=await Promise.all([parseCSVFile(nf),parseCSVFile(ef)]);
+      nodes=nd.map((r,i)=>{
+        const id=(r.id||r.ID||r.name||("node"+i)).toString();
+        const x=r.x?+r.x:(100+(i%4)*160);
+        const y=r.y?+r.y:(100+Math.floor(i/4)*120);
+        const plateRaw=r.Plates||r.plates||r.Plate||"";
+        return {id,x,y,plate:plateRaw.toString()};
+      });
+      computeTextSizes(nodes);
+      links=ed.map(e=>{
+        const src=(e.source||e.Source||"").toString();
+        const tgt=(e.target||e.Target||"").toString();
+        const type=(e.type||e.Type||"").toString().trim().toLowerCase();
+        return {source:src,target:tgt,type:type||"default"};
+      });
+      links.forEach(l=>{
+        l.source=nodes.find(n=>n.id===l.source)||{id:l.source,x:0,y:0,rx:10,ry:10};
+        l.target=nodes.find(n=>n.id===l.target)||{id:l.target,x:0,y:0,rx:10,ry:10};
+      });
+      computePlatesFromNodes(); updatePlatesSelection(); drawNodes(); updateLinksPositions(); fitToView();
+    });
+
+    function loadDemo() {
+      nodes=[
+        {id:"Alpha",plate:"GroupA",x:200,y:160},
+        {id:"Beta",plate:"GroupA;Big Boys",x:380,y:160},
+        {id:"Gamma",plate:"log[i];Big Boys",x:380,y:320},
+        {id:"Delta",plate:"log[i]",x:200,y:320},
+        {id:"Epsilon",plate:"log[i]",x:560,y:320}
+      ];
+      computeTextSizes(nodes);
+      links=[
+        {source:"Alpha",target:"Beta",type:"logical"},
+        {source:"Beta",target:"Gamma",type:"stochastic"},
+        {source:"Gamma",target:"Delta",type:"logical"},
+        {source:"Gamma",target:"Epsilon",type:"stochastic"}
+      ];
+      links.forEach(l=>{
+        l.source=nodes.find(n=>n.id===l.source);
+        l.target=nodes.find(n=>n.id===l.target);
+      });
+      computePlatesFromNodes(); updatePlatesSelection(); drawNodes(); updateLinksPositions(); fitToView();
+    }
+    loadDemo();
+
+    const exportBtn=document.getElementById("exportBtn");
+    const exportMenu=document.getElementById("exportMenu");
+    exportBtn.addEventListener("click",()=>exportMenu.style.display=exportMenu.style.display==="block"?"none":"block");
+    window.addEventListener("click",e=>{
+      if(!exportBtn.contains(e.target)&&!exportMenu.contains(e.target))exportMenu.style.display="none";
+    });
+
+    function serializeSVG(){
+      const clone=svg.node().cloneNode(true);
+      clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
+      return new XMLSerializer().serializeToString(clone);
+    }
+
+    document.getElementById("exportSVG").addEventListener("click",()=>{
+      const s=serializeSVG();const blob=new Blob([s],{type:"image/svg+xml;charset=utf-8"});
+      const url=URL.createObjectURL(blob);const a=document.createElement("a");
+      a.href=url;a.download="graph.svg";a.click();URL.revokeObjectURL(url);
+      exportMenu.style.display="none";
+    });
+
+    document.getElementById("exportPNG").addEventListener("click",()=>{
+      const s=serializeSVG();const blob=new Blob([s],{type:"image/svg+xml;charset=utf-8"});
+      const url=URL.createObjectURL(blob);const img=new Image();
+      img.onload
+      img.onload = function() {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff"; // white background
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, width, height);
+        const pngUrl = canvas.toDataURL("image/png");
+        const a = document.createElement("a");
+        a.href = pngUrl;
+        a.download = "graph.png";
+        a.click();
+        URL.revokeObjectURL(url);
+        exportMenu.style.display = "none";
+      };
+      img.src = url;
+    });
+
+    // Resize behavior
+    window.addEventListener("resize", () => {
+      width = window.innerWidth - sidebarWidth;
+      height = window.innerHeight;
+      svg.attr("width", width).attr("height", height);
+    });
+
+  </script>
+</body>
+</html>
