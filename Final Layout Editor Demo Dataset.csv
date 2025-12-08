@@ -1,0 +1,22 @@
+label,type,plates,x,y
+"y[i,j]",node,for(i in 1:doses)/for(j in 1:plates),-191.7099609375,-100
+"mu[i,j]",node,for(i in 1:doses)/for(j in 1:plates),-63.9033203125,-100
+alpha,node,,63.9033203125,-160
+beta,node,,191.7099609375,-100
+x[i],node,for(i in 1:doses),-191.7099609375,60
+gamma,node,,-63.9033203125,120
+"lambda[i,j]",node,for(i in 1:doses)/for(j in 1:plates),63.9033203125,0
+tau,node,,191.7099609375,0
+sigma,node,,-191.7099609375,120
+doses,node,,-63.9033203125,120
+plates,node,,63.9033203125,120
+
+from,to,kind
+tau,"lambda[i,j]",stochastic
+alpha,"mu[i,j]",deterministic
+beta,"mu[i,j]",deterministic
+gamma,"mu[i,j]",deterministic
+"lambda[i,j]","mu[i,j]",deterministic
+x[i],"mu[i,j]",deterministic
+sigma,tau,deterministic
+"mu[i,j]","y[i,j]",stochastic
